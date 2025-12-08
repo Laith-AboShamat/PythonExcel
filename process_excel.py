@@ -42,7 +42,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
-from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.worksheet.table import Table, TableStyleInfo, TableList
 
 BAL_PATTERN_DEFAULT = "BAL-*.xlsx"
 SALES_PATTERN_DEFAULT = "Sales order shortages-*.xlsx"
@@ -131,6 +131,13 @@ class WorkbookBundle:
     transfer: Path
     perfect_order: Path
     clr: Path
+
+
+@dataclass
+class SheetUpdate:
+    sheet_name: Optional[str]
+    rows: List[List[Any]]
+    preserve_header: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -372,27 +379,27 @@ def execute_pipeline(
 
     apply_workbook_updates(
         bundle.inventory,
-        updates=[("inventory", bal_rows)],
+        updates=[SheetUpdate("inventory", bal_rows)],
         dry_run=dry_run,
     )
     apply_workbook_updates(
         bundle.shortages,
-        updates=[("Shortages+AllOreders", sheet1_rows)],
+        updates=[SheetUpdate("Shortages+AllOreders", sheet1_rows, preserve_header=True)],
         dry_run=dry_run,
     )
     apply_workbook_updates(
         bundle.transfer,
-        updates=[("inv", warehouse_rows)],
+        updates=[SheetUpdate("inv", warehouse_rows)],
         dry_run=dry_run,
     )
     apply_workbook_updates(
         bundle.perfect_order,
-        updates=[("new.shortages", sheet2_rows), ("inv", warehouse_rows)],
+        updates=[SheetUpdate("new.shortages", sheet2_rows), SheetUpdate("inv", warehouse_rows)],
         dry_run=dry_run,
     )
     apply_workbook_updates(
         bundle.clr,
-        updates=[(None, sheet2_rows)],
+        updates=[SheetUpdate(None, sheet2_rows)],
         dry_run=dry_run,
     )
 
@@ -592,15 +599,17 @@ def build_sales_sheet_two(df: pd.DataFrame) -> pd.DataFrame:
 
 def apply_workbook_updates(
     workbook_path: Path,
-    updates: Sequence[Tuple[Optional[str], List[List[Any]]]],
+    updates: Sequence[SheetUpdate],
     dry_run: bool,
 ) -> None:
     if not workbook_path.exists():
         raise FileNotFoundError(f"Workbook not found: {workbook_path}")
     wb = load_workbook(workbook_path)
     try:
-        for sheet_name, rows in updates:
-            ws = _resolve_sheet(wb, sheet_name)
+        for instruction in updates:
+            ws = _resolve_sheet(wb, instruction.sheet_name)
+            rows = instruction.rows
+            preserve_header = instruction.preserve_header
             data_row_count = max(len(rows) - 1, 0)
             logging.info(
                 "%s -> %s: preparing to write %d rows",
@@ -610,8 +619,12 @@ def apply_workbook_updates(
             )
             if dry_run:
                 continue
-            _clear_sheet(ws)
-            _write_rows(ws, rows)
+            _clear_sheet(ws, keep_header=preserve_header)
+            if preserve_header:
+                data_rows = rows[1:] if len(rows) > 1 else []
+                _write_rows(ws, data_rows, start_row=2)
+            else:
+                _write_rows(ws, rows)
         if dry_run:
             logging.info("Dry run active; skipping save for %s", workbook_path.name)
         else:
@@ -666,8 +679,14 @@ def update_sales_workbook(
                 )
                 continue
             _clear_sheet(ws)
-            row_count, col_count = _write_rows(ws, rows)
-            _ensure_table(ws, f"{_sanitize_table_name(name)}_Table", row_count, col_count)
+            start_row, row_count, col_count = _write_rows(ws, rows)
+            _ensure_table(
+                ws,
+                f"{_sanitize_table_name(name)}_Table",
+                start_row,
+                row_count,
+                col_count,
+            )
             logging.info(
                 "%s -> %s: wrote %d row(s)",
                 sales_path.name,
@@ -684,32 +703,52 @@ def update_sales_workbook(
         wb.close()
 
 
-def _clear_sheet(ws) -> None:
+def _clear_sheet(ws, keep_header: bool = False) -> None:
     max_row = ws.max_row or 1
-    ws.delete_rows(1, max_row)
+    if keep_header:
+        if max_row > 1:
+            ws.delete_rows(2, max_row - 1)
+    else:
+        ws.delete_rows(1, max_row)
     if hasattr(ws, "_tables"):
-        ws._tables = []
+        ws._tables = TableList()
 
 
-def _write_rows(ws, rows: List[List[Any]]) -> Tuple[int, int]:
+def _write_rows(
+    ws,
+    rows: List[List[Any]],
+    start_row: int = 1,
+) -> Tuple[int, int, int]:
     if not rows:
-        return 0, 0
+        return start_row, 0, 0
     column_count = 0
-    for r_idx, row in enumerate(rows, start=1):
+    for r_idx, row in enumerate(rows, start=start_row):
         for c_idx, value in enumerate(row, start=1):
             ws.cell(row=r_idx, column=c_idx, value=value)
             if c_idx > column_count:
                 column_count = c_idx
-    return len(rows), column_count
+    written_rows = len(rows)
+    return start_row, written_rows, column_count
 
 
-def _ensure_table(ws, table_name: str, row_count: int, column_count: int) -> None:
+def _ensure_table(
+    ws,
+    table_name: str,
+    start_row: int,
+    row_count: int,
+    column_count: int,
+) -> None:
     if row_count <= 0 or column_count <= 0:
         return
     end_column = get_column_letter(column_count)
-    ref = f"A1:{end_column}{row_count}"
+    end_row = start_row + row_count - 1
+    ref = f"A{start_row}:{end_column}{end_row}"
     if hasattr(ws, "_tables"):
-        ws._tables = [t for t in ws._tables if t.displayName != table_name]
+        preserved = TableList()
+        for table in ws._tables:
+            if table.displayName != table_name:
+                preserved.add(table)
+        ws._tables = preserved
     table = Table(displayName=table_name, ref=ref)
     style = TableStyleInfo(
         name="TableStyleMedium2",
