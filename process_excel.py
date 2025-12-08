@@ -693,6 +693,7 @@ def update_sales_workbook(
                 name,
                 max(len(rows) - 1, 0),
             )
+            # remove the extranal link refresh 
         if dry_run:
             logging.info("Dry run active; skipping save for %s", sales_path.name)
         else:
@@ -961,7 +962,7 @@ def launch_gui(args: argparse.Namespace) -> None:
                 shortages_file=optional_path("shortages"),
                 transfer_file=optional_path("transfer"),
                 perfect_order_file=optional_path("perfect_order"),
-                clr_file=optional_path("clr"),
+                clr_file=optional_path("clr"), # in sheet 1 ${sheet 1} in the for sheet
                 dry_run=bool(self.vars["dry_run"].get()),
                 verbose=bool(self.vars["verbose"].get()),
                 gui=True,
