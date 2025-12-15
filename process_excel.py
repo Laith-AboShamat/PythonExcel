@@ -708,10 +708,26 @@ def apply_workbook_updates(
                 data_rows = rows[1:] if len(rows) > 1 else []
                 _write_rows(ws, data_rows, start_row=2)
                 written_rows = len(data_rows)
+                if rows and column_count and data_rows:
+                    _ensure_table(
+                        ws,
+                        f"{_sanitize_table_name(ws.title)}_Table",
+                        1,
+                        len(rows),
+                        column_count,
+                    )
             else:
-                _, row_count, col_count = _write_rows(ws, rows)
+                start_row, row_count, col_count = _write_rows(ws, rows)
                 written_rows = max(row_count - 1, 0)
                 column_count = col_count
+                if row_count and col_count:
+                    _ensure_table(
+                        ws,
+                        f"{_sanitize_table_name(ws.title)}_Table",
+                        start_row,
+                        row_count,
+                        col_count,
+                    )
             logging.info(
                 "%s -> %s: wrote %d row(s)",
                 workbook_path.name,
@@ -837,6 +853,8 @@ def _clear_sheet(ws, keep_header: bool = False) -> None:
         ws.delete_rows(1, max_row)
     if hasattr(ws, "_tables"):
         ws._tables = TableList()
+    if ws.auto_filter and getattr(ws.auto_filter, "ref", None):
+        ws.auto_filter.ref = None
 
 
 def _write_rows(
