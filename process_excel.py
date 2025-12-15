@@ -80,10 +80,11 @@ ALL_SALES_LETTERS = [
 ]
 # Sheet1 mirrors the original FILTER output, so keep the full B:AQ span.
 SHEET1_OUTPUT_LETTERS = list(ALL_SALES_LETTERS)
-CHOOSECOLS_INDEXES = [1, 12, 13, 15, 16, 17, 30, 31]
+SHEET2_MAX_COLUMN_LETTER = "AE"
+SHEET2_MAX_COLUMN_INDEX = column_index_from_string(SHEET2_MAX_COLUMN_LETTER)
 SHEET2_COLUMN_LETTERS = [
-    get_column_letter(SALES_COL_START_INDEX + offset - 1)
-    for offset in CHOOSECOLS_INDEXES
+    get_column_letter(idx)
+    for idx in range(SALES_COL_START_INDEX, SHEET2_MAX_COLUMN_INDEX + 1)
 ]
 SHEET1_REQUIRED_COLUMNS = {"B", "Q", "AE"}
 SHEET2_REQUIRED_COLUMNS = {"B", "Q", "R", "AE"}
@@ -611,6 +612,8 @@ def _format_header_value(
         return fallback if fill_value is None else fill_value
     if isinstance(value, str):
         text = value.strip()
+        if text.startswith("="):
+            return fallback if fill_value is None else fill_value
         if text:
             return text
         if fill_value is not None:
