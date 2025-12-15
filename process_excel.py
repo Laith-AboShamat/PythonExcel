@@ -2,7 +2,7 @@
 """Automates daily Excel updates across BAL and sales order shortage trackers.
 
 The script performs the following operations in sequence:
-1) Copies the BAL Sheet1 columns A:H into the inventory sheet of the raw shortages workbook.
+1) Builds BAL Sheet2 with Sheet1 columns (Item number through Napco weight (Kg)) filtered to CW available physical > 0 and copies the result into the inventory sheet of the raw shortages workbook.
 2) Rebuilds "Sheet 1" from the sales order shortages workbook using the requested FILTER logic
    and writes the result into the Shortages+AllOreders sheet.
 3) Filters BAL rows by warehouse code (STORE-002/010/027/041) and pushes the subset into
@@ -80,11 +80,10 @@ ALL_SALES_LETTERS = [
 ]
 # Sheet1 mirrors the original FILTER output, so keep the full B:AQ span.
 SHEET1_OUTPUT_LETTERS = list(ALL_SALES_LETTERS)
-SHEET2_MAX_COLUMN_LETTER = "AE"
-SHEET2_MAX_COLUMN_INDEX = column_index_from_string(SHEET2_MAX_COLUMN_LETTER)
+CHOOSECOLS_INDEXES = [1, 12, 13, 15, 16, 17, 30, 31]
 SHEET2_COLUMN_LETTERS = [
-    get_column_letter(idx)
-    for idx in range(SALES_COL_START_INDEX, SHEET2_MAX_COLUMN_INDEX + 1)
+    get_column_letter(SALES_COL_START_INDEX + offset - 1)
+    for offset in CHOOSECOLS_INDEXES
 ]
 SHEET1_REQUIRED_COLUMNS = {"B", "Q", "AE"}
 SHEET2_REQUIRED_COLUMNS = {"B", "Q", "R", "AE"}
@@ -98,6 +97,19 @@ WORKBOOK_PATTERNS = {
     "perfect_order": ["perfect order start*.xlsx"],
     "clr": ["Sales order shortagesCLRs*.xlsx"],
 }
+
+BAL_REQUIRED_HEADERS = [
+    "Item number",
+    "Search name",
+    "Warehouse",
+    "Name",
+    "CW physical inventory",
+    "Physical inventory",
+    "CW available physical",
+    "Napco weight (Kg)",
+]
+BAL_AVAILABLE_HEADER = "CW available physical"
+BAL_NULLISH_TEXT = {"", "null", "none"}
 
 
 def default_root() -> Path:
@@ -125,6 +137,7 @@ class SheetUpdate:
     sheet_name: Optional[str]
     rows: List[List[Any]]
     preserve_header: bool = False
+    create_if_missing: bool = False
 
 
 @dataclass
@@ -365,9 +378,16 @@ def execute_pipeline(
 ) -> PipelineReport:
     start_time = time.perf_counter()
     sheet_metrics: List[SheetMetrics] = []
-    bal_rows = load_bal_rows(bundle.bal)
-    warehouse_col_idx = detect_warehouse_column_index(bal_rows, warehouse_column)
-    warehouse_rows = filter_bal_by_warehouse(bal_rows, warehouse_col_idx, WAREHOUSE_ALLOWED_VALUES)
+    bal_raw_rows = load_bal_rows(bundle.bal)
+    bal_selected_rows = select_bal_columns(bal_raw_rows, BAL_REQUIRED_HEADERS)
+    bal_filtered_rows = filter_bal_rows_by_available(bal_selected_rows, BAL_AVAILABLE_HEADER)
+    logging.info(
+        "BAL availability filter retained %d of %d row(s)",
+        max(len(bal_filtered_rows) - 1, 0),
+        max(len(bal_selected_rows) - 1, 0),
+    )
+    warehouse_col_idx = detect_warehouse_column_index(bal_filtered_rows, warehouse_column)
+    warehouse_rows = filter_bal_by_warehouse(bal_filtered_rows, warehouse_col_idx, WAREHOUSE_ALLOWED_VALUES)
 
     sales_df, header_map = load_sales_dataframe(bundle.sales)
     sheet1_df = build_sales_sheet_one(sales_df)
@@ -394,8 +414,16 @@ def execute_pipeline(
 
     sheet_metrics.extend(
         apply_workbook_updates(
+            bundle.bal,
+            updates=[SheetUpdate("Sheet2", bal_filtered_rows, create_if_missing=True)],
+            dry_run=dry_run,
+        )
+    )
+
+    sheet_metrics.extend(
+        apply_workbook_updates(
             bundle.inventory,
-            updates=[SheetUpdate("inventory", bal_rows)],
+            updates=[SheetUpdate("inventory", bal_filtered_rows)],
             dry_run=dry_run,
         )
     )
@@ -440,8 +468,13 @@ def execute_pipeline(
             output_rows=len(sheet2_df),
         ),
         FilterSnapshot(
+            name="BAL availability filter",
+            input_rows=max(len(bal_selected_rows) - 1, 0),
+            output_rows=max(len(bal_filtered_rows) - 1, 0),
+        ),
+        FilterSnapshot(
             name="BAL warehouse filter",
-            input_rows=max(len(bal_rows) - 1, 0),
+            input_rows=max(len(bal_filtered_rows) - 1, 0),
             output_rows=max(len(warehouse_rows) - 1, 0),
         ),
     ]
@@ -483,6 +516,82 @@ def load_bal_rows(bal_path: Path) -> List[List[Any]]:
         return rows
     finally:
         wb.close()
+
+
+def _normalize_header_key(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    return str(value).strip().casefold()
+
+
+def _build_header_index(header_row: Sequence[Any]) -> Dict[str, int]:
+    index: Dict[str, int] = {}
+    for idx, raw in enumerate(header_row):
+        key = _normalize_header_key(raw)
+        if key and key not in index:
+            index[key] = idx
+    return index
+
+
+def select_bal_columns(rows: List[List[Any]], required_headers: Sequence[str]) -> List[List[Any]]:
+    if not rows:
+        return rows
+    header_row = rows[0]
+    header_index = _build_header_index(header_row)
+    selected_indices: List[int] = []
+    selected_headers: List[Any] = []
+    for header in required_headers:
+        key = header.strip().casefold()
+        if key not in header_index:
+            raise KeyError(f"Column '{header}' not found in BAL sheet header.")
+        idx = header_index[key]
+        selected_indices.append(idx)
+        selected_headers.append(header_row[idx])
+    subset_rows: List[List[Any]] = [selected_headers]
+    for row in rows[1:]:
+        subset_rows.append([row[idx] if idx < len(row) else None for idx in selected_indices])
+    return trim_trailing_empty_rows(subset_rows)
+
+
+def _is_positive_available_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            return False
+        return value > 0
+    text = str(value).strip()
+    if not text:
+        return False
+    if text.casefold() in BAL_NULLISH_TEXT:
+        return False
+    text_numeric = text.replace(",", "")
+    try:
+        return float(text_numeric) > 0
+    except ValueError:
+        return False
+
+
+def filter_bal_rows_by_available(rows: List[List[Any]], header_name: str) -> List[List[Any]]:
+    if not rows:
+        return rows
+    header_row = rows[0]
+    header_index = _build_header_index(header_row)
+    key = header_name.strip().casefold()
+    if key not in header_index:
+        raise KeyError(f"Column '{header_name}' not found in BAL sheet header.")
+    idx = header_index[key]
+    filtered: List[List[Any]] = [header_row]
+    for row in rows[1:]:
+        if idx >= len(row):
+            continue
+        if _is_positive_available_value(row[idx]):
+            filtered.append(row)
+    if len(filtered) == 1:
+        return [header_row]
+    return trim_trailing_empty_rows(filtered)
 
 
 def detect_warehouse_column_index(rows: List[List[Any]], override_letter: Optional[str]) -> int:
@@ -683,7 +792,12 @@ def apply_workbook_updates(
         for instruction in updates:
             rows = instruction.rows
             preserve_header = instruction.preserve_header
-            ws = _resolve_sheet(wb, instruction.sheet_name)
+            ws = _resolve_sheet(
+                wb,
+                instruction.sheet_name,
+                instruction.create_if_missing,
+                dry_run,
+            )
             column_count = len(rows[0]) if rows else 0
             planned_rows = max(len(rows) - 1, 0)
             logging.info(
@@ -754,7 +868,17 @@ def apply_workbook_updates(
     return metrics
 
 
-def _resolve_sheet(wb, sheet_name: Optional[str]):
+class _DummySheet:
+    def __init__(self, title: str):
+        self.title = title
+
+
+def _resolve_sheet(
+    wb,
+    sheet_name: Optional[str],
+    create_if_missing: bool = False,
+    dry_run: bool = False,
+):
     if sheet_name:
         if sheet_name in wb.sheetnames:
             return wb[sheet_name]
@@ -763,6 +887,13 @@ def _resolve_sheet(wb, sheet_name: Optional[str]):
             if existing.strip().casefold() == normalized:
                 logging.info("Using sheet '%s' (matched requested '%s')", existing, sheet_name)
                 return wb[existing]
+        if create_if_missing:
+            if dry_run:
+                logging.info("Dry run: would create sheet '%s'", sheet_name)
+                return _DummySheet(sheet_name)
+            ws = wb.create_sheet(title=sheet_name)
+            logging.info("Created sheet '%s'", sheet_name)
+            return ws
         source = getattr(wb, "path", "<workbook>")
         available = ", ".join(wb.sheetnames)
         raise KeyError(
