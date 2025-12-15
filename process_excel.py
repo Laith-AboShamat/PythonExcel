@@ -5,8 +5,8 @@ The script performs the following operations in sequence:
 1) Builds BAL Sheet2 with Sheet1 columns (Item number through Napco weight (Kg)) filtered to CW available physical > 0 and copies the result into the inventory sheet of the raw shortages workbook.
 2) Rebuilds "Sheet 1" from the sales order shortages workbook using the requested FILTER logic
    and writes the result into the Shortages+AllOreders sheet.
-3) Filters BAL rows by warehouse code (STORE-002/010/027/041) and pushes the subset into
-   the inv sheet of the color transfer workbook.
+3) Filters BAL rows by warehouse code (STORE-002/010/027/041) plus MF-prefixed item numbers
+    and pushes the subset into the inv sheet of the color transfer workbook.
 4) Rebuilds "Sheet 2" from the sales order shortages workbook (FILTER + CHOOSECOLS) and
    writes it into the perfect order workbook (new.shortages) and the CLR workbook (sheet 1).
 5) Refreshes the perfect order inv sheet with the warehouse-filtered BAL rows.
@@ -110,6 +110,10 @@ BAL_REQUIRED_HEADERS = [
 ]
 BAL_AVAILABLE_HEADER = "CW available physical"
 BAL_NULLISH_TEXT = {"", "null", "none"}
+BAL_ITEM_HEADER = "Item number"
+BAL_MF_PREFIX = "MF"
+CLR_MAX_COLUMN_INDEX = column_index_from_string("H")
+PERFECT_ORDER_MAX_COLUMN_INDEX = column_index_from_string("AR")
 
 
 def default_root() -> Path:
@@ -138,6 +142,9 @@ class SheetUpdate:
     rows: List[List[Any]]
     preserve_header: bool = False
     create_if_missing: bool = False
+    start_column: int = 1
+    max_columns: Optional[int] = None
+    unhide_columns: bool = False
 
 
 @dataclass
@@ -388,6 +395,7 @@ def execute_pipeline(
     )
     warehouse_col_idx = detect_warehouse_column_index(bal_filtered_rows, warehouse_column)
     warehouse_rows = filter_bal_by_warehouse(bal_filtered_rows, warehouse_col_idx, WAREHOUSE_ALLOWED_VALUES)
+    transfer_rows = filter_rows_by_prefix(warehouse_rows, BAL_ITEM_HEADER, BAL_MF_PREFIX)
 
     sales_df, header_map = load_sales_dataframe(bundle.sales)
     sheet1_df = build_sales_sheet_one(sales_df)
@@ -437,21 +445,37 @@ def execute_pipeline(
     sheet_metrics.extend(
         apply_workbook_updates(
             bundle.transfer,
-            updates=[SheetUpdate("inv", warehouse_rows)],
+            updates=[SheetUpdate("inv", transfer_rows)],
             dry_run=dry_run,
         )
     )
     sheet_metrics.extend(
         apply_workbook_updates(
             bundle.perfect_order,
-            updates=[SheetUpdate("new.shortages", sheet2_rows), SheetUpdate("inv", warehouse_rows)],
+            updates=[
+                SheetUpdate(
+                    "new.shortages",
+                    sheet2_rows,
+                    start_column=1,
+                    max_columns=PERFECT_ORDER_MAX_COLUMN_INDEX,
+                    unhide_columns=True,
+                ),
+                SheetUpdate("inv", warehouse_rows),
+            ],
             dry_run=dry_run,
         )
     )
     sheet_metrics.extend(
         apply_workbook_updates(
             bundle.clr,
-            updates=[SheetUpdate("Sheet1", sheet2_rows)],
+            updates=[
+                SheetUpdate(
+                    "Sheet1",
+                    sheet2_rows,
+                    start_column=1,
+                    max_columns=CLR_MAX_COLUMN_INDEX,
+                )
+            ],
             dry_run=dry_run,
         )
     )
@@ -476,6 +500,11 @@ def execute_pipeline(
             name="BAL warehouse filter",
             input_rows=max(len(bal_filtered_rows) - 1, 0),
             output_rows=max(len(warehouse_rows) - 1, 0),
+        ),
+        FilterSnapshot(
+            name="BAL MF transfer filter",
+            input_rows=max(len(warehouse_rows) - 1, 0),
+            output_rows=max(len(transfer_rows) - 1, 0),
         ),
     ]
 
@@ -588,6 +617,35 @@ def filter_bal_rows_by_available(rows: List[List[Any]], header_name: str) -> Lis
         if idx >= len(row):
             continue
         if _is_positive_available_value(row[idx]):
+            filtered.append(row)
+    if len(filtered) == 1:
+        return [header_row]
+    return trim_trailing_empty_rows(filtered)
+
+
+def filter_rows_by_prefix(
+    rows: List[List[Any]],
+    header_name: str,
+    prefix: str,
+) -> List[List[Any]]:
+    if not rows:
+        return rows
+    header_row = rows[0]
+    header_index = _build_header_index(header_row)
+    key = header_name.strip().casefold()
+    if key not in header_index:
+        raise KeyError(f"Column '{header_name}' not found in sheet header.")
+    idx = header_index[key]
+    upper_prefix = prefix.strip().upper()
+    filtered: List[List[Any]] = [header_row]
+    for row in rows[1:]:
+        if idx >= len(row):
+            continue
+        value = row[idx]
+        if value is None:
+            continue
+        text = str(value).strip().upper()
+        if text.startswith(upper_prefix):
             filtered.append(row)
     if len(filtered) == 1:
         return [header_row]
@@ -792,14 +850,23 @@ def apply_workbook_updates(
         for instruction in updates:
             rows = instruction.rows
             preserve_header = instruction.preserve_header
+            start_column = max(1, instruction.start_column)
+            if instruction.max_columns is not None:
+                target_columns = max(instruction.max_columns, 0)
+            elif rows:
+                target_columns = max(len(row) for row in rows)
+            else:
+                target_columns = 0
+            data_row_count = max(len(rows) - 1, 0)
+            is_partial = instruction.max_columns is not None or start_column != 1
             ws = _resolve_sheet(
                 wb,
                 instruction.sheet_name,
                 instruction.create_if_missing,
                 dry_run,
             )
-            column_count = len(rows[0]) if rows else 0
-            planned_rows = max(len(rows) - 1, 0)
+            planned_rows = data_row_count
+            columns_metric = target_columns if target_columns else (len(rows[0]) if rows else 0)
             logging.info(
                 "%s -> %s: preparing to write %d rows",
                 workbook_path.name,
@@ -812,33 +879,55 @@ def apply_workbook_updates(
                         workbook=workbook_path,
                         sheet=ws.title,
                         rows_written=planned_rows,
-                        columns_written=column_count,
+                        columns_written=columns_metric,
                         dry_run=True,
                     )
                 )
                 continue
-            _clear_sheet(ws, keep_header=preserve_header)
-            if preserve_header:
-                data_rows = rows[1:] if len(rows) > 1 else []
-                _write_rows(ws, data_rows, start_row=2)
-                written_rows = len(data_rows)
-                if rows and column_count and data_rows:
+            written_rows = planned_rows
+            if is_partial:
+                rows_to_write = rows[1:] if preserve_header else rows
+                write_start_row = 2 if preserve_header else 1
+                end_row_estimate = write_start_row + len(rows_to_write) - 1 if rows_to_write else write_start_row - 1
+                clear_start_row = 2 if preserve_header else 1
+                clear_end_row = max(ws.max_row, end_row_estimate)
+                end_column = start_column + target_columns - 1 if target_columns else start_column - 1
+                if target_columns:
+                    _clear_range(ws, clear_start_row, clear_end_row, start_column, end_column)
+                    if rows_to_write:
+                        _write_rows_range(ws, rows_to_write, write_start_row, start_column, target_columns)
+                elif not preserve_header:
+                    _clear_range(ws, clear_start_row, clear_end_row, start_column, start_column)
+                if instruction.unhide_columns and target_columns:
+                    for col_idx in range(start_column, end_column + 1):
+                        ws.column_dimensions[get_column_letter(col_idx)].hidden = False
+            else:
+                _clear_sheet(ws, keep_header=preserve_header)
+                if preserve_header:
+                    data_rows = rows[1:] if len(rows) > 1 else []
+                    _write_rows(ws, data_rows, start_row=2)
+                    written_rows = len(data_rows)
+                    if rows and target_columns:
+                        table_columns = len(rows[0]) if rows else target_columns
+                        _ensure_table(
+                            ws,
+                            f"{_sanitize_table_name(ws.title)}_Table",
+                            1,
+                            len(rows),
+                            table_columns,
+                        )
+                        columns_metric = table_columns
+                else:
+                    start_row, row_count, col_count = _write_rows(ws, rows)
+                    written_rows = max(row_count - 1, 0)
+                    columns_metric = col_count
+                if not preserve_header and rows:
+                    row_count = len(rows)
+                    col_count = columns_metric if columns_metric else (len(rows[0]) if rows else 0)
                     _ensure_table(
                         ws,
                         f"{_sanitize_table_name(ws.title)}_Table",
                         1,
-                        len(rows),
-                        column_count,
-                    )
-            else:
-                start_row, row_count, col_count = _write_rows(ws, rows)
-                written_rows = max(row_count - 1, 0)
-                column_count = col_count
-                if row_count and col_count:
-                    _ensure_table(
-                        ws,
-                        f"{_sanitize_table_name(ws.title)}_Table",
-                        start_row,
                         row_count,
                         col_count,
                     )
@@ -853,7 +942,7 @@ def apply_workbook_updates(
                     workbook=workbook_path,
                     sheet=ws.title,
                     rows_written=written_rows,
-                    columns_written=column_count,
+                    columns_written=columns_metric,
                     dry_run=False,
                 )
             )
@@ -988,6 +1077,24 @@ def _clear_sheet(ws, keep_header: bool = False) -> None:
         ws.auto_filter.ref = None
 
 
+def _clear_range(
+    ws,
+    start_row: int,
+    end_row: int,
+    start_column: int,
+    end_column: int,
+) -> None:
+    if end_row < start_row or end_column < start_column:
+        return
+    for row_idx in range(start_row, end_row + 1):
+        for col_idx in range(start_column, end_column + 1):
+            ws.cell(row=row_idx, column=col_idx, value=None)
+    if hasattr(ws, "_tables") and ws._tables:
+        ws._tables = TableList()
+    if ws.auto_filter and getattr(ws.auto_filter, "ref", None):
+        ws.auto_filter.ref = None
+
+
 def _write_rows(
     ws,
     rows: List[List[Any]],
@@ -1003,6 +1110,28 @@ def _write_rows(
                 column_count = c_idx
     written_rows = len(rows)
     return start_row, written_rows, column_count
+
+
+def _write_rows_range(
+    ws,
+    rows: List[List[Any]],
+    start_row: int,
+    start_column: int,
+    column_span: int,
+) -> Tuple[int, int]:
+    if column_span <= 0:
+        return 0, 0
+    if not rows:
+        return 0, column_span
+    for r_offset, row in enumerate(rows):
+        for c_offset in range(column_span):
+            value = row[c_offset] if c_offset < len(row) else None
+            ws.cell(
+                row=start_row + r_offset,
+                column=start_column + c_offset,
+                value=value,
+            )
+    return len(rows), column_span
 
 
 def _ensure_table(
