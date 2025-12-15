@@ -35,6 +35,7 @@ import logging
 import math
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -77,23 +78,8 @@ ALL_SALES_LETTERS = [
     get_column_letter(idx)
     for idx in range(SALES_COL_START_INDEX, SALES_COL_END_INDEX + 1)
 ]
-SHEET1_OUTPUT_LETTERS = [
-    "B",
-    "C",
-    "D",
-    "E",
-    "G",
-    "H",
-    "I",
-    "J",
-    "S",
-    "T",
-    "W",
-    "Y",
-    "AH",
-    "AL",
-    "AM",
-]
+# Sheet1 mirrors the original FILTER output, so keep the full B:AQ span.
+SHEET1_OUTPUT_LETTERS = list(ALL_SALES_LETTERS)
 CHOOSECOLS_INDEXES = [1, 12, 13, 15, 16, 17, 30, 31]
 SHEET2_COLUMN_LETTERS = [
     get_column_letter(SALES_COL_START_INDEX + offset - 1)
@@ -138,6 +124,31 @@ class SheetUpdate:
     sheet_name: Optional[str]
     rows: List[List[Any]]
     preserve_header: bool = False
+
+
+@dataclass
+class SheetMetrics:
+    workbook: Path
+    sheet: str
+    rows_written: int
+    columns_written: int
+    dry_run: bool
+
+
+@dataclass
+class FilterSnapshot:
+    name: str
+    input_rows: int
+    output_rows: int
+
+
+@dataclass
+class PipelineReport:
+    root: Path
+    dry_run: bool
+    duration_seconds: float
+    filters: List[FilterSnapshot]
+    sheets: List[SheetMetrics]
 
 
 def parse_args() -> argparse.Namespace:
@@ -349,7 +360,10 @@ def execute_pipeline(
     bundle: WorkbookBundle,
     warehouse_column: Optional[str],
     dry_run: bool,
-) -> None:
+    base_root: Path,
+) -> PipelineReport:
+    start_time = time.perf_counter()
+    sheet_metrics: List[SheetMetrics] = []
     bal_rows = load_bal_rows(bundle.bal)
     warehouse_col_idx = detect_warehouse_column_index(bal_rows, warehouse_column)
     warehouse_rows = filter_bal_by_warehouse(bal_rows, warehouse_col_idx, WAREHOUSE_ALLOWED_VALUES)
@@ -364,7 +378,6 @@ def execute_pipeline(
         header_map,
         FILTER_FALLBACK_MESSAGE,
         fill_value=0,
-        header_fill_value="0",
     )
     sheet2_rows = build_rows(
         sheet2_df,
@@ -372,35 +385,73 @@ def execute_pipeline(
         header_map,
         FILTER_FALLBACK_MESSAGE,
         fill_value=0,
-        header_fill_value="0",
     )
 
-    update_sales_workbook(bundle.sales, sheet1_rows, sheet2_rows, dry_run)
+    sheet_metrics.extend(
+        update_sales_workbook(bundle.sales, sheet1_rows, sheet2_rows, dry_run)
+    )
 
-    apply_workbook_updates(
-        bundle.inventory,
-        updates=[SheetUpdate("inventory", bal_rows)],
-        dry_run=dry_run,
+    sheet_metrics.extend(
+        apply_workbook_updates(
+            bundle.inventory,
+            updates=[SheetUpdate("inventory", bal_rows)],
+            dry_run=dry_run,
+        )
     )
-    apply_workbook_updates(
-        bundle.shortages,
-        updates=[SheetUpdate("Shortages+AllOreders", sheet1_rows, preserve_header=True)],
-        dry_run=dry_run,
+    sheet_metrics.extend(
+        apply_workbook_updates(
+            bundle.shortages,
+            updates=[SheetUpdate("Shortages+AllOreders", sheet1_rows, preserve_header=True)],
+            dry_run=dry_run,
+        )
     )
-    apply_workbook_updates(
-        bundle.transfer,
-        updates=[SheetUpdate("inv", warehouse_rows)],
-        dry_run=dry_run,
+    sheet_metrics.extend(
+        apply_workbook_updates(
+            bundle.transfer,
+            updates=[SheetUpdate("inv", warehouse_rows)],
+            dry_run=dry_run,
+        )
     )
-    apply_workbook_updates(
-        bundle.perfect_order,
-        updates=[SheetUpdate("new.shortages", sheet2_rows), SheetUpdate("inv", warehouse_rows)],
-        dry_run=dry_run,
+    sheet_metrics.extend(
+        apply_workbook_updates(
+            bundle.perfect_order,
+            updates=[SheetUpdate("new.shortages", sheet2_rows), SheetUpdate("inv", warehouse_rows)],
+            dry_run=dry_run,
+        )
     )
-    apply_workbook_updates(
-        bundle.clr,
-        updates=[SheetUpdate(None, sheet2_rows)],
+    sheet_metrics.extend(
+        apply_workbook_updates(
+            bundle.clr,
+            updates=[SheetUpdate("Sheet1", sheet2_rows)],
+            dry_run=dry_run,
+        )
+    )
+
+    filters = [
+        FilterSnapshot(
+            name="Sales Sheet1 filter",
+            input_rows=len(sales_df),
+            output_rows=len(sheet1_df),
+        ),
+        FilterSnapshot(
+            name="Sales Sheet2 filter",
+            input_rows=len(sales_df),
+            output_rows=len(sheet2_df),
+        ),
+        FilterSnapshot(
+            name="BAL warehouse filter",
+            input_rows=max(len(bal_rows) - 1, 0),
+            output_rows=max(len(warehouse_rows) - 1, 0),
+        ),
+    ]
+
+    duration = time.perf_counter() - start_time
+    return PipelineReport(
+        root=base_root,
         dry_run=dry_run,
+        duration_seconds=duration,
+        filters=filters,
+        sheets=sheet_metrics,
     )
 
 
@@ -519,6 +570,7 @@ def build_rows(
         format_header_value_with_fill(header_map.get(letter), letter, header_fill_value)
         for letter in column_order
     ]
+    header_row = _deduplicate_headers(header_row)
     if df.empty:
         if fill_value is not None:
             zero_row = [fill_value] * len(column_order)
@@ -567,6 +619,24 @@ def _format_header_value(
     return value
 
 
+def _deduplicate_headers(headers: Sequence[Any]) -> List[str]:
+    counts: Dict[str, int] = {}
+    adjusted: List[str] = []
+    for raw in headers:
+        base = str(raw) if raw is not None else ""
+        if not base.strip():
+            base = "Column"
+        index = counts.get(base, 0)
+        candidate = base if index == 0 else f"{base}_{index}"
+        while candidate in counts:
+            index += 1
+            candidate = f"{base}_{index}"
+        counts[base] = index + 1
+        counts[candidate] = 1
+        adjusted.append(candidate)
+    return adjusted
+
+
 def build_sales_sheet_one(df: pd.DataFrame) -> pd.DataFrame:
     ensure_columns(df, SHEET1_REQUIRED_COLUMNS.union(SHEET1_OUTPUT_REQUIRED_COLUMNS))
     q_series = normalize_series(df["Q"])
@@ -601,30 +671,59 @@ def apply_workbook_updates(
     workbook_path: Path,
     updates: Sequence[SheetUpdate],
     dry_run: bool,
-) -> None:
+) -> List[SheetMetrics]:
     if not workbook_path.exists():
         raise FileNotFoundError(f"Workbook not found: {workbook_path}")
     wb = load_workbook(workbook_path)
+    metrics: List[SheetMetrics] = []
     try:
         for instruction in updates:
-            ws = _resolve_sheet(wb, instruction.sheet_name)
             rows = instruction.rows
             preserve_header = instruction.preserve_header
-            data_row_count = max(len(rows) - 1, 0)
+            ws = _resolve_sheet(wb, instruction.sheet_name)
+            column_count = len(rows[0]) if rows else 0
+            planned_rows = max(len(rows) - 1, 0)
             logging.info(
                 "%s -> %s: preparing to write %d rows",
                 workbook_path.name,
                 ws.title,
-                data_row_count,
+                planned_rows,
             )
             if dry_run:
+                metrics.append(
+                    SheetMetrics(
+                        workbook=workbook_path,
+                        sheet=ws.title,
+                        rows_written=planned_rows,
+                        columns_written=column_count,
+                        dry_run=True,
+                    )
+                )
                 continue
             _clear_sheet(ws, keep_header=preserve_header)
             if preserve_header:
                 data_rows = rows[1:] if len(rows) > 1 else []
                 _write_rows(ws, data_rows, start_row=2)
+                written_rows = len(data_rows)
             else:
-                _write_rows(ws, rows)
+                _, row_count, col_count = _write_rows(ws, rows)
+                written_rows = max(row_count - 1, 0)
+                column_count = col_count
+            logging.info(
+                "%s -> %s: wrote %d row(s)",
+                workbook_path.name,
+                ws.title,
+                written_rows,
+            )
+            metrics.append(
+                SheetMetrics(
+                    workbook=workbook_path,
+                    sheet=ws.title,
+                    rows_written=written_rows,
+                    columns_written=column_count,
+                    dry_run=False,
+                )
+            )
         if dry_run:
             logging.info("Dry run active; skipping save for %s", workbook_path.name)
         else:
@@ -633,6 +732,7 @@ def apply_workbook_updates(
             logging.info("Saved %s", workbook_path.name)
     finally:
         wb.close()
+    return metrics
 
 
 def _resolve_sheet(wb, sheet_name: Optional[str]):
@@ -657,27 +757,37 @@ def update_sales_workbook(
     sheet1_rows: List[List[Any]],
     sheet2_rows: List[List[Any]],
     dry_run: bool,
-) -> None:
+) -> List[SheetMetrics]:
     wb = load_workbook(sales_path)
+    metrics: List[SheetMetrics] = []
     try:
         targets = [("Sheet1", sheet1_rows), ("Sheet2", sheet2_rows)]
         for name, rows in targets:
-            if name in wb.sheetnames:
-                ws = wb[name]
-            elif dry_run:
-                logging.info("Dry run: would create sheet '%s' in %s", name, sales_path.name)
-                continue
-            else:
-                ws = wb.create_sheet(title=name)
-                logging.info("Created sheet '%s' in %s", name, sales_path.name)
+            data_rows = max(len(rows) - 1, 0)
+            column_count = len(rows[0]) if rows else 0
             if dry_run:
                 logging.info(
-                    "Dry run: would write %d data row(s) to %s!%s",
-                    max(len(rows) - 1, 0),
+                    "Dry run: would write %d row(s) with %d column(s) to %s!%s",
+                    data_rows,
+                    column_count,
                     sales_path.name,
                     name,
                 )
+                metrics.append(
+                    SheetMetrics(
+                        workbook=sales_path,
+                        sheet=name,
+                        rows_written=data_rows,
+                        columns_written=column_count,
+                        dry_run=True,
+                    )
+                )
                 continue
+            if name in wb.sheetnames:
+                ws = wb[name]
+            else:
+                ws = wb.create_sheet(title=name)
+                logging.info("Created sheet '%s' in %s", name, sales_path.name)
             _clear_sheet(ws)
             start_row, row_count, col_count = _write_rows(ws, rows)
             _ensure_table(
@@ -687,11 +797,21 @@ def update_sales_workbook(
                 row_count,
                 col_count,
             )
+            written_rows = max(row_count - 1, 0)
             logging.info(
                 "%s -> %s: wrote %d row(s)",
                 sales_path.name,
                 name,
-                max(len(rows) - 1, 0),
+                written_rows,
+            )
+            metrics.append(
+                SheetMetrics(
+                    workbook=sales_path,
+                    sheet=ws.title,
+                    rows_written=written_rows,
+                    columns_written=col_count,
+                    dry_run=False,
+                )
             )
             # remove the extranal link refresh 
         if dry_run:
@@ -702,6 +822,7 @@ def update_sales_workbook(
             logging.info("Saved %s (Sheet1 & Sheet2 refreshed)", sales_path.name)
     finally:
         wb.close()
+    return metrics
 
 
 def _clear_sheet(ws, keep_header: bool = False) -> None:
@@ -776,11 +897,33 @@ def remove_external_links(wb) -> None:
         logging.debug("Removed %d external link(s) before saving", len(links))
 
 
-def orchestrate(args: argparse.Namespace) -> None:
+def orchestrate(args: argparse.Namespace) -> PipelineReport:
     root = args.root.expanduser().resolve()
     logging.info("Using root folder: %s", root)
     bundle = collect_workbook_bundle(args, root)
-    execute_pipeline(bundle, args.warehouse_column, args.dry_run)
+    report = execute_pipeline(bundle, args.warehouse_column, args.dry_run, root)
+    logging.info(
+        "Pipeline finished in %.2f seconds (%s)",
+        report.duration_seconds,
+        "dry run" if report.dry_run else "live write",
+    )
+    for snapshot in report.filters:
+        logging.info(
+            "Filter '%s': %d -> %d rows",
+            snapshot.name,
+            snapshot.input_rows,
+            snapshot.output_rows,
+        )
+    for metric in report.sheets:
+        logging.info(
+            "Workbook %s -> %s: %d row(s), %d column(s) [%s]",
+            metric.workbook.name,
+            metric.sheet,
+            metric.rows_written,
+            metric.columns_written,
+            "dry run" if metric.dry_run else "written",
+        )
+    return report
 
 
 def launch_gui(args: argparse.Namespace) -> None:
@@ -833,6 +976,7 @@ def launch_gui(args: argparse.Namespace) -> None:
             self.window.columnconfigure(0, weight=1)
             self.window.rowconfigure(0, weight=1)
             self.worker: Optional[threading.Thread] = None
+            self.latest_report: Optional[PipelineReport] = None
 
             self._filedialog = filedialog
             self._ttk = ttk
@@ -915,11 +1059,68 @@ def launch_gui(args: argparse.Namespace) -> None:
             ttk.Label(frame, textvariable=self.status_var).grid(row=row, column=1, sticky="w", pady=(10, 6))
             row += 1
 
-            ttk.Label(frame, text="Log output").grid(row=row, column=0, sticky="w")
+            ttk.Label(frame, text="Log & Reports").grid(row=row, column=0, sticky="w")
             row += 1
-            self.log_widget = scrolledtext.ScrolledText(frame, height=12, state="disabled", wrap="word")
-            self.log_widget.grid(row=row, column=0, columnspan=3, sticky="nsew")
+
+            self.notebook = ttk.Notebook(frame)
+            self.notebook.grid(row=row, column=0, columnspan=3, sticky="nsew")
             frame.rowconfigure(row, weight=1)
+
+            log_tab = ttk.Frame(self.notebook)
+            report_tab = ttk.Frame(self.notebook)
+            self.notebook.add(log_tab, text="Log")
+            self.notebook.add(report_tab, text="Reports")
+            self.report_tab = report_tab
+
+            self.log_widget = scrolledtext.ScrolledText(log_tab, height=12, state="disabled", wrap="word")
+            self.log_widget.pack(fill="both", expand=True)
+
+            self.report_summary_var = tk.StringVar(value="Run the process to generate a report.")
+            ttk.Label(
+                report_tab,
+                textvariable=self.report_summary_var,
+                wraplength=520,
+                justify="left",
+            ).pack(anchor="w", padx=12, pady=(12, 8))
+
+            filter_frame = ttk.LabelFrame(report_tab, text="Filter Summary")
+            filter_frame.pack(fill="x", padx=12, pady=(0, 8))
+            self.filter_tree = ttk.Treeview(
+                filter_frame,
+                columns=("stage", "input", "output"),
+                show="headings",
+                height=4,
+            )
+            self.filter_tree.heading("stage", text="Stage")
+            self.filter_tree.heading("input", text="Input rows")
+            self.filter_tree.heading("output", text="Output rows")
+            self.filter_tree.column("stage", anchor="w", width=260)
+            self.filter_tree.column("input", anchor="center", width=120)
+            self.filter_tree.column("output", anchor="center", width=120)
+            self.filter_tree.pack(fill="x", expand=False, padx=10, pady=8)
+
+            work_frame = ttk.LabelFrame(report_tab, text="Workbook Updates")
+            work_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+            self.work_tree = ttk.Treeview(
+                work_frame,
+                columns=("workbook", "sheet", "rows", "cols", "mode"),
+                show="headings",
+                height=6,
+            )
+            self.work_tree.heading("workbook", text="Workbook")
+            self.work_tree.heading("sheet", text="Sheet")
+            self.work_tree.heading("rows", text="Rows")
+            self.work_tree.heading("cols", text="Columns")
+            self.work_tree.heading("mode", text="Mode")
+            self.work_tree.column("workbook", anchor="w", width=180)
+            self.work_tree.column("sheet", anchor="w", width=150)
+            self.work_tree.column("rows", anchor="center", width=80)
+            self.work_tree.column("cols", anchor="center", width=90)
+            self.work_tree.column("mode", anchor="center", width=100)
+            work_scroll = ttk.Scrollbar(work_frame, orient="vertical", command=self.work_tree.yview)
+            self.work_tree.configure(yscrollcommand=work_scroll.set)
+            self.work_tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+            work_scroll.pack(side="right", fill="y", padx=(0, 8), pady=8)
 
         def _browse_root(self) -> None:
             directory = self._filedialog.askdirectory(
@@ -994,7 +1195,65 @@ def launch_gui(args: argparse.Namespace) -> None:
 
         def _show_dialog(self, dialog_callable, title: str, message: str) -> None:
             self._set_running(False)
+            self.status_var.set("Idle")
+            self._reset_report_view("No report generated.")
             dialog_callable(title, message)
+
+        def _reset_report_view(self, status: str = "Run the process to generate a report.") -> None:
+            if hasattr(self, "report_summary_var"):
+                self.report_summary_var.set(status)
+            for tree in (
+                getattr(self, "filter_tree", None),
+                getattr(self, "work_tree", None),
+            ):
+                if tree is None:
+                    continue
+                for item in tree.get_children():
+                    tree.delete(item)
+
+        def _populate_report_view(self, report: PipelineReport) -> None:
+            total_rows = sum(metric.rows_written for metric in report.sheets)
+            mode_text = "Dry run (no files changed)" if report.dry_run else "Live write (files updated)"
+            summary_lines = [
+                f"Mode: {mode_text}",
+                f"Elapsed: {report.duration_seconds:.2f} s",
+                f"Rows touched: {total_rows}",
+                f"Root: {report.root}",
+            ]
+            self.report_summary_var.set("\n".join(summary_lines))
+
+            for item in self.filter_tree.get_children():
+                self.filter_tree.delete(item)
+            for snapshot in report.filters:
+                self.filter_tree.insert(
+                    "",
+                    "end",
+                    values=(snapshot.name, snapshot.input_rows, snapshot.output_rows),
+                )
+
+            for item in self.work_tree.get_children():
+                self.work_tree.delete(item)
+            for metric in report.sheets:
+                mode_label = "Dry run" if metric.dry_run else "Written"
+                self.work_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        metric.workbook.name,
+                        metric.sheet,
+                        metric.rows_written,
+                        metric.columns_written,
+                        mode_label,
+                    ),
+                )
+            self.notebook.select(self.report_tab)
+
+        def _handle_success(self, report: PipelineReport, message: str) -> None:
+            self._set_running(False)
+            self.status_var.set(message)
+            self.latest_report = report
+            self._populate_report_view(report)
+            messagebox.showinfo("Success", message)
 
         def _collect_preferences(self) -> Dict[str, str]:
             values: Dict[str, str] = {
@@ -1038,13 +1297,14 @@ def launch_gui(args: argparse.Namespace) -> None:
 
             save_preferences(self._collect_preferences())
             self._clear_log()
+            self._reset_report_view("Processing...")
             self._configure_logging(args.verbose)
             self._set_running(True)
 
             def worker() -> None:
                 try:
                     logging.info("Starting processing...")
-                    orchestrate(args)
+                    report = orchestrate(args)
                 except Exception as exc:
                     logging.error("Processing failed: %s", exc)
                     self.window.after(
@@ -1056,7 +1316,7 @@ def launch_gui(args: argparse.Namespace) -> None:
                     logging.info(completion_msg)
                     self.window.after(
                         0,
-                        lambda: self._show_dialog(messagebox.showinfo, "Success", "Processing finished successfully."),
+                        lambda: self._handle_success(report, completion_msg),
                     )
                 finally:
                     self.worker = None
