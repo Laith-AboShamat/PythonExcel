@@ -4,11 +4,11 @@
 The script performs the following operations in sequence:
 1) Builds BAL Sheet2 with Sheet1 columns (Item number through Napco weight (Kg)) filtered to CW available physical > 0 and copies the result into the inventory sheet of the raw shortages workbook.
 2) Rebuilds "Sheet 1" from the sales order shortages workbook using the requested FILTER logic
-   and writes the result into the Shortages+AllOreders sheet.
+    and writes the result into the Shortages+AllOreders sheet and the perfect order new.shortages sheet (A:AP).
 3) Filters BAL rows by warehouse code (STORE-002/010/027/041) plus MF-prefixed item numbers
     and pushes the subset into the inv sheet of the color transfer workbook.
 4) Rebuilds "Sheet 2" from the sales order shortages workbook (FILTER + CHOOSECOLS) and
-   writes it into the perfect order workbook (new.shortages) and the CLR workbook (sheet 1).
+    writes it into the CLR workbook (sheet 1) while leaving other columns untouched.
 5) Refreshes the perfect order inv sheet with the warehouse-filtered BAL rows.
 
 You can either let the script auto-discover workbooks using the glob patterns below or provide
@@ -113,7 +113,7 @@ BAL_NULLISH_TEXT = {"", "null", "none"}
 BAL_ITEM_HEADER = "Item number"
 BAL_MF_PREFIX = "MF"
 CLR_MAX_COLUMN_INDEX = column_index_from_string("H")
-PERFECT_ORDER_MAX_COLUMN_INDEX = column_index_from_string("AR")
+PERFECT_ORDER_MAX_COLUMN_INDEX = column_index_from_string("AP")
 
 
 def default_root() -> Path:
@@ -455,7 +455,7 @@ def execute_pipeline(
             updates=[
                 SheetUpdate(
                     "new.shortages",
-                    sheet2_rows,
+                    sheet1_rows,
                     start_column=1,
                     max_columns=PERFECT_ORDER_MAX_COLUMN_INDEX,
                     unhide_columns=True,
